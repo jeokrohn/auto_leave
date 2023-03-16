@@ -10,10 +10,10 @@ import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import backoff
-import certifi
 import websockets
 from dotenv import load_dotenv
 from pydantic import Extra, parse_obj_as
@@ -69,6 +69,7 @@ class Device(ApiModel):
 class WebexObject(ApiModel):
     class Config:
         extra = Extra.ignore
+
     id: Optional[str]
     object_type: str
     global_id: Optional[str]
@@ -83,8 +84,10 @@ class Activity(ApiModel):
     """
     Model to deserialize activities received on the websocket
     """
+
     class Config:
         extra = Extra.ignore
+
     object_type: str
     url: str
     published: datetime
@@ -102,20 +105,35 @@ class Activity(ApiModel):
         return self.actor and self.actor.email_address
 
 
+def start_auth_flow(auth_url: str):
+    log.info(f'Please open this url in your browser to obtain tokens: {auth_url}')
+
+
 def build_integration() -> Integration:
     """
     read integration parameters from environment variables and create an integration
 
     :return: :class:`wxc_sdk.integration.Integration` instance
     """
+
+    def is_docker():
+        cgroup = Path("/proc/self/cgroup")
+        return Path('/.dockerenv').is_file() or cgroup.is_file() and cgroup.read_text().find("docker") > -1
+
     client_id = os.getenv('INTEGRATION_CLIENT_ID')
     client_secret = os.getenv('INTEGRATION_CLIENT_SECRET')
     scopes = parse_scopes(os.getenv('INTEGRATION_SCOPES'))
     redirect_url = 'http://localhost:6001/redirect'
     if not all((client_id, client_secret, scopes)):
         raise ValueError('failed to get integration parameters from environment')
+
+    if is_docker():
+        auth = start_auth_flow
+    else:
+        auth = None
     return Integration(client_id=client_id, client_secret=client_secret, scopes=scopes,
-                       redirect_url=redirect_url)
+                       redirect_url=redirect_url,
+                       initiate_flow_callback=auth)
 
 
 def token_yml_path() -> str:
@@ -281,7 +299,6 @@ class SpaceMonitor:
             ws_url = device.web_socket_url
             log.info(f"Opening websocket {ws_url}")
             ssl_context = ssl.create_default_context()
-            ssl_context.load_verify_locations(certifi.where())
 
             async with websockets.connect(ws_url, ssl=ssl_context) as websocket:
                 log.info("WebSocket Opened.")

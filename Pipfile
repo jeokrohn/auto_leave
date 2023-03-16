@@ -4,13 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-wxc-sdk = "*"
 python-dotenv = "*"
 backoff = "*"
 websockets = "*"
 pydantic = "*"
-certifi = "*"
 pyyaml = "*"
+wxc-sdk = {git = "https://github.com/jeokrohn/wxc_sdk"}
 
 [dev-packages]
 

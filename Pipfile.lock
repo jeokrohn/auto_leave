@@ -1,7 +1,7 @@
 {
     "_meta": {
         "hash": {
-            "sha256": "9670b0010ea28fd316f5be83b38fe76012635202fb120e11e0c595b4384a5477"
+            "sha256": "fbf31cce3f94ddf61bf25dc819910bad74bb6fca895691a1b0398f7cee02289b"
         },
         "pipfile-spec": 6,
         "requires": {
@@ -154,7 +154,7 @@
                 "sha256:35824b4c3a97115964b408844d64aa14db1cc518f6562e8d7261699d1350a9e3",
                 "sha256:4ad3232f5e926d6718ec31cfc1fcadfde020920e278684144551c91769c7bc18"
             ],
-            "index": "pypi",
+            "markers": "python_version >= '3.6'",
             "version": "==2022.12.7"
         },
         "charset-normalizer": {
@@ -633,12 +633,8 @@
             "version": "==10.4"
         },
         "wxc-sdk": {
-            "hashes": [
-                "sha256:10a4357b45615b24fe5c60b5d3f4aedd6f9144da2bae142a9d8f69a542c210e5",
-                "sha256:72c2877c269f1764277e452d5f53614475131f9039d4317ca258bde25d622fbd"
-            ],
-            "index": "pypi",
-            "version": "==1.12.0"
+            "git": "https://github.com/jeokrohn/wxc_sdk",
+            "ref": "5e24f12c423300f8a1e3fec1bf2a32ffa8f0724f"
         },
         "yarl": {
             "hashes": [
