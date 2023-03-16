@@ -1,0 +1,7 @@
+# sample config file, rename to "auto_leave.yml" and modify the block list below
+blocked:
+  # list of regular expressions to match space titles to be blocked
+  - humpty
+  - dumpty
+  - .+Stupid\w+
+  - Dustin H.+

@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+wxc-sdk = "*"
+python-dotenv = "*"
+backoff = "*"
+websockets = "*"
+pydantic = "*"
+certifi = "*"
+pyyaml = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.9"
