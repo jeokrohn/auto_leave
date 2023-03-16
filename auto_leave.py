@@ -15,6 +15,7 @@ from typing import Optional
 
 import backoff
 import websockets
+import yaml
 from dotenv import load_dotenv
 from pydantic import Extra, parse_obj_as
 from wxc_sdk.as_api import AsWebexSimpleApi
@@ -136,38 +137,6 @@ def build_integration() -> Integration:
                        initiate_flow_callback=auth)
 
 
-def token_yml_path() -> str:
-    """
-    determine path of YML file to persist tokens
-
-    :return: path to YML file
-    :rtype: str
-    """
-    return os.path.join(os.getcwd(), f'{os.path.splitext(os.path.basename(__file__))[0]}_tokens.yml')
-
-
-def config_yml_path() -> str:
-    """
-    determine path of YML config file
-
-    :return: path to YML file
-    :rtype: str
-    """
-    return os.path.join(os.getcwd(), f'{os.path.splitext(os.path.basename(__file__))[0]}.yml')
-
-
-def get_tokens() -> Optional[Tokens]:
-    """
-    Tokens are read from a YML file. If needed an OAuth flow is initiated.
-
-    :return: tokens
-    :rtype: :class:`wxc_sdk.tokens.Tokens`
-    """
-    integration = build_integration()
-    tokens = integration.get_cached_tokens_from_yml(yml_path=token_yml_path())
-    return tokens
-
-
 @dataclass(init=False)
 class SpaceMonitor:
     """
@@ -178,13 +147,61 @@ class SpaceMonitor:
         * leave immediately if needed
     * start an initial task to check whether any spaces on the block list exist and leave them
     """
-    api: AsWebexSimpleApi
-    #: list of regular expressions to check space names against
+    tokens: Tokens
+    integration: Integration
+    # list of regular expressions to check space names against
     block_list: list[re.Pattern]
     me: Person
     # set to keep references to scheduled tasks.
     # see: https://docs.python.org/3/library/asyncio-task.html#creating-tasks
     tasks: set
+
+    def __init__(self):
+        """
+        Set up the space monitor instance
+        """
+        self.api = None
+        self.tasks = set()
+        self.websocket = None
+
+    async def close(self):
+        if self.api:
+            await self.api.close()
+
+    @staticmethod
+    def token_yml_path() -> str:
+        """
+        determine path of YML file to persist tokens
+        """
+        return os.path.join(os.getcwd(), f'{os.path.splitext(os.path.basename(__file__))[0]}_tokens.yml')
+
+    @staticmethod
+    def config_yml_path() -> str:
+        """
+        determine path of YML config file
+        """
+        return os.path.join(os.getcwd(), f'{os.path.splitext(os.path.basename(__file__))[0]}.yml')
+
+    def write_tokens(self, tokens_to_cache: Tokens):
+        """
+        Write tokens to YML file
+        """
+        with open(self.token_yml_path(), mode='w') as f:
+            yaml.safe_dump(json.loads(tokens_to_cache.json()), f)
+        return
+
+    def read_tokens(self) -> Optional[Tokens]:
+        """
+        Read tokens from YML file
+        """
+        try:
+            with open(self.token_yml_path(), mode='r') as f:
+                data = yaml.safe_load(f)
+                tokens_read = Tokens.parse_obj(data)
+        except Exception as e:
+            log.info(f'failed to read tokens from file: {e}')
+            tokens_read = None
+        return tokens_read
 
     async def _get_devices(self) -> list[Device]:
         """
@@ -199,6 +216,7 @@ class SpaceMonitor:
         Get a device from WDM or create a new one if none exists
         """
         devices = await self._get_devices()
+        # try to find "our" device
         device = next((d for d in devices if d.name == DEVICE_NAME), None)
         if device is None:
             # create new device
@@ -206,26 +224,37 @@ class SpaceMonitor:
             device = Device.parse_obj(r)
         return device
 
-    def __init__(self, *, api: AsWebexSimpleApi, block_list: list[str]):
+    @backoff.on_exception(backoff.expo, Exception)
+    async def _token_monitor(self):
         """
-        Set up the space monitor instance
-        :param api:
-        :param block_list:
+        Task monitoring the access token validity and refreshing the access token if needed
         """
-        # cache API instance
-        self.api = api
-        # try to compile all entries in the block list. Force block list regexes to match full space titles
-        try:
-            self.block_list = list(map(lambda b: re.compile(f'^{b}$'), block_list))
-        except re.error as e:
-            print(f'Failed to compile block list regular expression: {e}')
-            exit(1)
-        self.tasks = set()
+        while True:
+            remaining_seconds = self.tokens.remaining
+            log.debug(f'_token_monitor: access token valid until {self.tokens.expires_at} exires in '
+                      f'{remaining_seconds} seconds')
+            # we want to renew 30 minutes before the expiration
+            to_wait = max(1, remaining_seconds - 30 * 60)
+            log.debug(f'_token_monitor: wait for {to_wait} seconds')
+            await asyncio.sleep(to_wait)
+
+            # run sync io in extra thread
+            def refresh_tokens():
+                # get a new access token
+                self.integration.refresh(tokens=self.tokens)
+                self.write_tokens(self.tokens)
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, refresh_tokens)
+
+            # after refreshing the access token send new authentication on websocket
+            await self._websocket_auth()
+
+        return
 
     async def _activity_in_blocked_space(self, space: Room):
         """
         We detected activity in an unwanted space
-        :param space: the space the activity happened in
         """
         # TODO: is the other one a bot? Look for @webex.bot in person_email
         memberships = await self.api.membership.list(room_id=space.id)
@@ -281,15 +310,58 @@ class SpaceMonitor:
         task.add_done_callback(self.tasks.discard)
         return
 
-    async def run(self):
+    async def _websocket_auth(self):
+        """
+        Send authentication/authorization message on websocket
+        """
+        # send authentication/authorization message
+        msg = {'id': str(uuid.uuid4()),
+               'type': 'authorization',
+               'data': {'token': 'Bearer ' + self.api.access_token}}
+        await self.websocket.send(json.dumps(msg))
+
+    async def run(self) -> int:
         """
         Run the space monitor
         """
+        try:
+            with open(self.config_yml_path(), mode='r') as file:
+                config = safe_load(file)
+            block_list = config['blocked']
+        except Exception as e:
+            print(f'Failed to read config: {e}')
+            return 1
+        # try to compile all entries in the block list. Force block list regexes to match full space titles
+        try:
+            self.block_list = list(map(lambda b: re.compile(f'^{b}$'), block_list))
+        except re.error as e:
+            print(f'Failed to compile block list regular expression: {e}')
+            return 1
+
+        self.integration = build_integration()
+        tokens = self.integration.get_cached_tokens(read_from_cache=self.read_tokens, write_to_cache=self.write_tokens)
+        if tokens is None:
+            print('Failed to get tokens', file=sys.stderr)
+            return 1
+        self.tokens = tokens
+        self.api = AsWebexSimpleApi(tokens=tokens)
+
         # get/register a device from/with WDM
         # get person details
-        device, self.me = await asyncio.gather(self._get_or_create_device(),
-                                               self.api.people.me())
-        device: Device
+        try:
+            device, self.me = await asyncio.gather(self._get_or_create_device(),
+                                                   self.api.people.me())
+            device: Device
+        except RestError as e:
+            log.error(f'Failed to init (get/set device, get identity): {e}')
+            return 1
+
+        log.info(f'monitoring conversation activities for {self.me.display_name}({self.me.emails[0]})')
+
+        # schedule the access token monitoring task
+        task = asyncio.create_task(self._token_monitor())
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
 
         @backoff.on_exception(backoff.expo, websockets.ConnectionClosedError)
         @backoff.on_exception(backoff.expo, websockets.ConnectionClosedOK)
@@ -301,12 +373,9 @@ class SpaceMonitor:
             ssl_context = ssl.create_default_context()
 
             async with websockets.connect(ws_url, ssl=ssl_context) as websocket:
+                self.websocket = websocket
                 log.info("WebSocket Opened.")
-                # send authentication/authorization message
-                msg = {'id': str(uuid.uuid4()),
-                       'type': 'authorization',
-                       'data': {'token': 'Bearer ' + self.api.access_token}}
-                await websocket.send(json.dumps(msg))
+                await self._websocket_auth()
 
                 while True:
                     # continuously receive and handle ws messages
@@ -316,46 +385,32 @@ class SpaceMonitor:
                         await self._handle_message(message)
                     except Exception as handle_error:
                         log.error(f'Failed to handle message: {handle_error}')
+            return
 
         try:
             await _connect_and_listen()
         except Exception as e:
+            # should not really happen as we try to catch everything using backoff but ...
             log.error(f"Error working the websocket: {e}")
-        return
+            return 1
+        return 0
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
         return
 
 
 async def main():
     load_dotenv()
-    try:
-        with open(config_yml_path(), mode='r') as file:
-            config = safe_load(file)
-        block_list = config['blocked']
-    except Exception as e:
-        print(f'Failed to read config: {e}')
-        exit(1)
-    tokens = get_tokens()
-    if tokens is None:
-        print('Failed to get tokens', file=sys.stderr)
-        exit(1)
-    async with AsWebexSimpleApi(tokens=tokens) as api:
-        try:
-            me = await api.people.me()
-        except RestError as e:
-            print(f'Failed to determine authenticated user: {e}')
-            exit(1)
-        print(f'Authenticated as {me.display_name}({me.emails[0]})')
-        # noinspection PyUnboundLocalVariable
-        async with SpaceMonitor(api=api, block_list=block_list) as monitor:
-            await monitor.run()
+    async with SpaceMonitor() as monitor:
+        exit_code = await monitor.run()
+    exit(exit_code)
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     logging.getLogger('wxc_sdk.as_rest').setLevel(logging.INFO)
     asyncio.run(main())
