@@ -79,10 +79,12 @@ class WebexObject(ApiModel):
         return self.object_type == 'conversation' and self.global_id or None
 
 
-class Activity(MyModel):
+class Activity(ApiModel):
     """
     Model to deserialize activities received on the websocket
     """
+    class Config:
+        extra = Extra.ignore
     object_type: str
     url: str
     published: datetime
@@ -226,21 +228,21 @@ class SpaceMonitor:
         """
         activity: Activity = Activity.parse_obj(data['activity'])
         space_gid = activity.space_id
-        log.debug(f'conversation_activity: {activity.verb} {activity.object.object_type}')
+        log.info(f'conversation_activity: {activity.verb} {activity.object.object_type}')
         if space_gid is None:
             return
 
         # check if the space name is on the block list
         space = await self.api.rooms.details(room_id=space_gid)
-        log.debug(f'conversation activity: {activity.verb} {activity.object.object_type} by {activity.actor_email} '
-                  f'in space "{space.title}"')
+        log.info(f'conversation activity: {activity.verb} {activity.object.object_type} by {activity.actor_email} '
+                 f'in space "{space.title}"')
 
         if activity.actor_email == self.me.emails[0]:
             # ignore activities by me
             return
         if any(b.match(space.title) for b in self.block_list):
             # this space is on the block list
-            log.debug(f'Space "{space.title}" is on the block list')
+            log.info(f'Space "{space.title}" is on the block list')
             await self._activity_in_blocked_space(space)
         return
 
@@ -295,8 +297,8 @@ class SpaceMonitor:
                     log.debug("WebSocket Received Message(raw): %s\n" % message)
                     try:
                         await self._handle_message(message)
-                    except Exception as e:
-                        log.error(f'Failed to handle message: {e}')
+                    except Exception as handle_error:
+                        log.error(f'Failed to handle message: {handle_error}')
 
         try:
             await _connect_and_listen()
@@ -337,6 +339,6 @@ async def main():
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
     logging.getLogger('wxc_sdk.as_rest').setLevel(logging.INFO)
     asyncio.run(main())
