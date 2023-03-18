@@ -1,7 +1,16 @@
-# sample config file, rename to "auto_leave.yml" and modify the block list below
+# sample config file, rename to "auto_leave.yml" and modify the settings below
+
+# hide 1:1 spaces
+hide_direct: False
+# actually leave group spaces? Caution: groups spaces can't be joined back; You will have to be re-added by someone else
+leave_group_spaces: False
+# enable debug logging to console
+debug_logging: True
+# enable logging of REST requests. If enabled REST requests will also be logged to file "auto_leave_rest.log"
+rest_logging: True
 blocked:
   # list of regular expressions to match space titles to be blocked
   - humpty
   - dumpty
   - .+Stupid\w+
-  - Dustin H.+
+  - Dustin Harris

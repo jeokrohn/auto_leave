@@ -235,7 +235,7 @@
                 "sha256:f8303414c7b03f794347ad062c0516cee0e15f7a612abd0ce1e25caf6ceb47df",
                 "sha256:fca62a8301b605b954ad2e9c3666f9d97f63872aa4efcae5492baca2056b74ab"
             ],
-            "markers": "python_full_version >= '3.7.0'",
+            "markers": "python_version >= '3.7'",
             "version": "==3.1.0"
         },
         "frozenlist": {
@@ -522,7 +522,7 @@
                 "sha256:64299f4909223da747622c030b781c0d7811e359c37124b4bd368fb8c6518baa",
                 "sha256:98b1b2782e3c6c4904938b84c0eb932721069dfdb9134313beff7c83c2df24bf"
             ],
-            "markers": "python_version >= '3.7' and python_version < '4'",
+            "markers": "python_version >= '3.7' and python_version < '4.0'",
             "version": "==2.28.2"
         },
         "requests-toolbelt": {
@@ -634,7 +634,7 @@
         },
         "wxc-sdk": {
             "git": "https://github.com/jeokrohn/wxc_sdk",
-            "ref": "5e24f12c423300f8a1e3fec1bf2a32ffa8f0724f"
+            "ref": "d27d17bfbe9e86340db80e266aabbc4a5b306192"
         },
         "yarl": {
             "hashes": [

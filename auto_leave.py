@@ -7,6 +7,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,13 +17,15 @@ from typing import Optional
 import backoff
 import websockets
 import yaml
+from aiohttp import ClientConnectorError
 from dotenv import load_dotenv
-from pydantic import Extra, parse_obj_as
+from pydantic import Extra, parse_obj_as, BaseModel, Field
 from wxc_sdk.as_api import AsWebexSimpleApi
 from wxc_sdk.as_rest import AsRestError as RestError
 from wxc_sdk.base import ApiModel
 from wxc_sdk.common import RoomType
 from wxc_sdk.integration import Integration
+from wxc_sdk.memberships import Membership
 from wxc_sdk.people import Person
 from wxc_sdk.rooms import Room
 from wxc_sdk.scopes import parse_scopes
@@ -30,6 +33,7 @@ from wxc_sdk.tokens import Tokens
 from yaml import safe_load
 
 log = logging.getLogger(__name__)
+ws_log = logging.getLogger(f'{__name__}.websocket')
 
 DEFAULT_DEVICE_URL = "https://wdm-a.wbx2.com/wdm/api/v1"
 
@@ -106,6 +110,21 @@ class Activity(ApiModel):
         return self.actor and self.actor.email_address
 
 
+class Config(BaseModel):
+    """
+    Model to parse config or
+    """
+
+    class Config:
+        extra = Extra.forbid
+
+    hide_direct: bool = Field(default=False)
+    leave_group_spaces: bool = Field(default=False)
+    debug_logging: bool = Field(default=True)
+    rest_logging: bool = Field(default=True)
+    blocked: list[str] = Field(default_factory=list)
+
+
 def start_auth_flow(auth_url: str):
     log.info(f'Please open this url in your browser to obtain tokens: {auth_url}')
 
@@ -147,14 +166,19 @@ class SpaceMonitor:
         * leave immediately if needed
     * start an initial task to check whether any spaces on the block list exist and leave them
     """
-    tokens: Tokens
-    integration: Integration
+    # the Space Monitor config
+    config: Config
     # list of regular expressions to check space names against
     block_list: list[re.Pattern]
+    tokens: Tokens
+    integration: Integration
+    api: AsWebexSimpleApi
+    device: Device
     me: Person
     # set to keep references to scheduled tasks.
     # see: https://docs.python.org/3/library/asyncio-task.html#creating-tasks
     tasks: set
+    space_cache: dict[str, Room]
 
     def __init__(self):
         """
@@ -163,6 +187,7 @@ class SpaceMonitor:
         self.api = None
         self.tasks = set()
         self.websocket = None
+        self.space_cache = dict()
 
     async def close(self):
         if self.api:
@@ -224,18 +249,18 @@ class SpaceMonitor:
             device = Device.parse_obj(r)
         return device
 
-    @backoff.on_exception(backoff.expo, Exception)
+    @backoff.on_exception(backoff.expo, Exception, max_value=60)
     async def _token_monitor(self):
         """
         Task monitoring the access token validity and refreshing the access token if needed
         """
         while True:
             remaining_seconds = self.tokens.remaining
-            log.debug(f'_token_monitor: access token valid until {self.tokens.expires_at} exires in '
+            log.debug(f'access token valid until {self.tokens.expires_at} exires in '
                       f'{remaining_seconds} seconds')
             # we want to renew 30 minutes before the expiration
             to_wait = max(1, remaining_seconds - 30 * 60)
-            log.debug(f'_token_monitor: wait for {to_wait} seconds')
+            log.debug(f'wait for {to_wait} seconds')
             await asyncio.sleep(to_wait)
 
             # run sync io in extra thread
@@ -256,18 +281,41 @@ class SpaceMonitor:
         """
         We detected activity in an unwanted space
         """
-        # TODO: is the other one a bot? Look for @webex.bot in person_email
         memberships = await self.api.membership.list(room_id=space.id)
         membership = next((m for m in memberships
                            if m.person_id == self.me.person_id),
                           None)
+        if not membership:
+            log.error(f'couldn\'t find membership for space "{space.title}"')
+            return
+        membership: Membership
         try:
-            if space.type == RoomType.direct:
-                # try to hide the space
-                membership.is_room_hidden = True
-                await self.api.membership.update(update=membership)
+            if space.type == RoomType.direct and not membership.is_room_hidden:
+                log.info(f'action, set space "{space.title}" to hidden, '
+                         f'hide direct: {self.config.hide_direct}')
+                if self.config.hide_direct:
+                    # try to hide the space
+                    membership.is_room_hidden = True
+                    await self.api.membership.update(update=membership)
+            elif space.type == RoomType.group:
+                log.info(f'action, leave space "{space.title}", '
+                         f'leave group spaces: {self.config.leave_group_spaces}')
+                if self.config.leave_group_spaces:
+                    await self.api.membership.delete(membership_id=membership.id)
         except RestError as e:
-            log.error(f'activity_in_blocked_space: Error, {e}')
+            log.error(f'Error, {e}')
+
+    async def _get_space_details(self, space_id: str) -> Room:
+        """
+        Get space details from cache
+        """
+        if (space := self.space_cache.get(space_id)) is None:
+            space = await self.api.rooms.details(room_id=space_id)
+            self.space_cache[space_id] = space
+            log.debug(f'not served from cache: "{space.title}"')
+        else:
+            log.debug(f'served from cache: "{space.title}"')
+        return space
 
     async def _conversation_activity(self, data: dict):
         """
@@ -275,14 +323,24 @@ class SpaceMonitor:
         """
         activity: Activity = Activity.parse_obj(data['activity'])
         space_gid = activity.space_id
-        log.info(f'conversation_activity: {activity.verb} {activity.object.object_type}')
+        log.debug(f'{activity.verb} {activity.object.object_type}')
         if space_gid is None:
             return
 
+        # only act on new messages of someone (me) getting added to a space..
+        if activity.verb not in {'post', 'add'}:
+            log.debug(f'ignore activity {activity.verb}')
+            return
+
+        # only act on 'add' if this is about me
+        if activity.verb == 'add' and (not activity.object or activity.object.email_address != self.me.emails[0]):
+            log.debug(f'ignore add {activity.object.email_address}, not me')
+            return
+
         # check if the space name is on the block list
-        space = await self.api.rooms.details(room_id=space_gid)
-        log.info(f'conversation activity: {activity.verb} {activity.object.object_type} by {activity.actor_email} '
-                 f'in space "{space.title}"')
+        space = await self._get_space_details(space_id=space_gid)
+        log.debug(f'{activity.verb} {activity.object.object_type} by {activity.actor_email} '
+                  f'in space "{space.title}"')
 
         if activity.actor_email == self.me.emails[0]:
             # ignore activities by me
@@ -300,8 +358,9 @@ class SpaceMonitor:
         msg = json.loads(message_str)
 
         data = msg['data']
-        if data['eventType'] != 'conversation.activity':
-            log.debug('not a conversation activity')
+        event_type = data['eventType']
+        if event_type != 'conversation.activity':
+            log.debug(f'not a conversation activity. Event type: {event_type}')
             return
         # schedule an async task to handle conversation activity
         # keep a reference of the task in a set to avoid that the task gets garbage collected
@@ -320,40 +379,78 @@ class SpaceMonitor:
                'data': {'token': 'Bearer ' + self.api.access_token}}
         await self.websocket.send(json.dumps(msg))
 
+    def _setup_logging(self):
+        """
+        Set up logging
+        """
+        log_fmt = '%(asctime)s %(levelname)s %(name)s %(funcName)s %(message)s'
+        logging.basicConfig(level=logging.DEBUG if self.config.debug_logging else logging.INFO,
+                            format=log_fmt)
+        logging.Formatter.converter = time.gmtime
+        rest_logger = logging.getLogger('wxc_sdk.as_rest')
+        if self.config.rest_logging:
+            rest_logger.propagate = True
+            rest_logger.setLevel(logging.DEBUG)
+            log_path = f'{self.config_yml_path()[:-4]}_rest.log'
+            file_handler = logging.FileHandler(log_path, mode='w')
+            formatter = logging.Formatter(log_fmt)
+            file_handler.setFormatter(formatter)
+            rest_logger.addHandler(file_handler)
+        else:
+            rest_logger.setLevel(logging.INFO)
+        logging.getLogger('websockets.client').setLevel(logging.INFO)
+        ws_log.setLevel(logging.INFO)
+        return
+
+    @backoff.on_exception(backoff.expo,
+                          (ClientConnectorError, socket.gaierror),
+                          max_value=30)
+    async def _init_monitor(self)->bool:
+        """
+        Initialization of monitor
+        :return:
+        """
+
+        self.integration = build_integration()
+        tokens = self.integration.get_cached_tokens(read_from_cache=self.read_tokens, write_to_cache=self.write_tokens)
+        if tokens is None:
+            print('Failed to get tokens', file=sys.stderr)
+            return False
+        self.tokens = tokens
+        async with AsWebexSimpleApi(tokens=tokens) as api:
+            self.api = api
+            # get/register a device from/with WDM
+            # get person details
+            try:
+                self.device, self.me = await asyncio.gather(self._get_or_create_device(),
+                                                            self.api.people.me())
+            except RestError as e:
+                log.error(f'Failed to init (get/set device, get identity): {e}')
+                return False
+        self.api = AsWebexSimpleApi(tokens=tokens)
+        return True
+
     async def run(self) -> int:
         """
         Run the space monitor
         """
         try:
             with open(self.config_yml_path(), mode='r') as file:
-                config = safe_load(file)
-            block_list = config['blocked']
+                self.config = Config.parse_obj(safe_load(file))
         except Exception as e:
             print(f'Failed to read config: {e}')
             return 1
         # try to compile all entries in the block list. Force block list regexes to match full space titles
         try:
-            self.block_list = list(map(lambda b: re.compile(f'^{b}$'), block_list))
+            self.block_list = list(map(lambda b: re.compile(f'^{b}$'), self.config.blocked))
         except re.error as e:
             print(f'Failed to compile block list regular expression: {e}')
             return 1
 
-        self.integration = build_integration()
-        tokens = self.integration.get_cached_tokens(read_from_cache=self.read_tokens, write_to_cache=self.write_tokens)
-        if tokens is None:
-            print('Failed to get tokens', file=sys.stderr)
-            return 1
-        self.tokens = tokens
-        self.api = AsWebexSimpleApi(tokens=tokens)
+        self._setup_logging()
 
-        # get/register a device from/with WDM
-        # get person details
-        try:
-            device, self.me = await asyncio.gather(self._get_or_create_device(),
-                                                   self.api.people.me())
-            device: Device
-        except RestError as e:
-            log.error(f'Failed to init (get/set device, get identity): {e}')
+        success = await self._init_monitor()
+        if not success:
             return 1
 
         log.info(f'monitoring conversation activities for {self.me.display_name}({self.me.emails[0]})')
@@ -363,35 +460,36 @@ class SpaceMonitor:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-        @backoff.on_exception(backoff.expo, websockets.ConnectionClosedError)
-        @backoff.on_exception(backoff.expo, websockets.ConnectionClosedOK)
-        @backoff.on_exception(backoff.expo, websockets.ConnectionClosed)
-        @backoff.on_exception(backoff.expo, socket.gaierror)
+        @backoff.on_exception(backoff.expo,
+                              (ClientConnectorError, websockets.ConnectionClosedError,
+                               websockets.ConnectionClosedOK, websockets.ConnectionClosed,
+                               socket.gaierror),
+                              max_value=30)
         async def _connect_and_listen():
-            ws_url = device.web_socket_url
-            log.info(f"Opening websocket {ws_url}")
+            ws_url = self.device.web_socket_url
+            ws_log.info(f"Opening websocket {ws_url}")
             ssl_context = ssl.create_default_context()
 
             async with websockets.connect(ws_url, ssl=ssl_context) as websocket:
                 self.websocket = websocket
-                log.info("WebSocket Opened.")
+                ws_log.info("WebSocket Opened.")
                 await self._websocket_auth()
 
                 while True:
                     # continuously receive and handle ws messages
                     message = await websocket.recv()
-                    log.debug("WebSocket Received Message(raw): %s\n" % message)
+                    ws_log.debug("WebSocket Received Message(raw): %s\n" % message)
                     try:
                         await self._handle_message(message)
                     except Exception as handle_error:
-                        log.error(f'Failed to handle message: {handle_error}')
+                        ws_log.error(f'Failed to handle message: {handle_error}')
             return
 
         try:
             await _connect_and_listen()
         except Exception as e:
             # should not really happen as we try to catch everything using backoff but ...
-            log.error(f"Error working the websocket: {e}")
+            ws_log.error(f"Error working the websocket: {e}")
             return 1
         return 0
 
@@ -411,6 +509,4 @@ async def main():
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
-    logging.getLogger('wxc_sdk.as_rest').setLevel(logging.INFO)
     asyncio.run(main())
